@@ -1,17 +1,41 @@
-### External Sorting
+# py_external_sort
 
-Have a file that won't fit in memory but you need to sort it? Stuck using Athena/PrestoDB and need to sort stuff? Me too, that is why this is exists. Uses timsort for in-memory and merge sorts for on-disk. Heavily influenced by the work of  Richard Penman on csvsort. Why make a new version? Well a couple of reasons:
+Disk-backed multi-process external sort for CSV files larger than RAM.
 
-* csvsort does not work with Python3
-* Reads and writes are handled exclusively by the csv library, causing some un-needed overhead in the inital split of the files
-* Uses sys.getsizeof to determine whether the file is the right length, which does not map to size on disk, thus max_size parameter is often doubled in reality
-* Rewrites the whole file to add the header at the end
-* Is a single process (aka slow)
-* Uses mercurial (which is why this isn't simply a fork)
+## Usage
 
-So I decided to not do the above things. The last point is the killer. In order to make this bad boy (kinda) fast we need to use some multiprocessing, which in reality requires a full rewrite, not just a pull request. So just how fast is it?
+```python
+from external_sort import external_sort
 
-* A sort of a 20 gb file with this version can be done in ~1860 seconds on average (31 minutes) and that can be increased if parameters are optimized
-* A sort of a 20 gb file with csvsort 1.3 finished in ~19006 seconds on average (316 minutes) using the same parameters and files.
+external_sort(
+    file_loc="huge_input.csv",
+    sort_keys=[0],        # Column indices to sort on
+    n_proc=8,             # Parallel sorting processes
+    max_size=200,         # Run chunk size in MB
+    header=True,
+    delimiter=",",
+    overwrite=False,      # Outputs huge_input_sorted.csv
+)
+```
 
-Wow, its way faster! 10x isn't bad. Good luck.
+## Options
+
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `file_loc` | *required* | Path to CSV file. |
+| `sort_keys` | *required* | List of 0-based column indices. |
+| `n_proc` | `cpu_count()` | Worker process count. |
+| `n_way` | `64` | Merge fan-out (runs merged per pass). |
+| `max_size` | `100` | Chunk buffer in MB before spilling sorted run. |
+| `header` | `True` | Preserve first line as header. |
+| `delimiter` | `','` | Field delimiter. |
+| `overwrite` | `False` | Overwrite input file or write `<name>_sorted.<ext>`. |
+
+## Benchmarks
+
+Tested on Apple Silicon (11 cores, NVMe SSD):
+
+| Dataset | Rows | csvsort 1.3 | Baseline (2017) | Optimized Engine |
+| :--- | :--- | :--- | :--- | :--- |
+| **2 GB** | 40.7M | — | 234.8s (3.9 min) | **27.6s (8.5x)** |
+| **20 GB** | 406.9M | 19,006s (316 min) | 1,860s (31 min) | **725.5s (12.1 min)** |

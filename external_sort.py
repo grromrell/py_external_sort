@@ -1,222 +1,150 @@
 import os
 import csv
 import heapq
-import hashlib
-from multiprocessing import Queue, Pool
+import tempfile
+import shutil
+from operator import itemgetter
+from multiprocessing import Pool, cpu_count
 
-def create_temp_files(file_loc, max_size, header=True):
-    """
-    Splits input file into smaller chunks as dictated by max_size. Files
-    are put into a temporary directory for sorting and merging
+def _make_key_extractor(sort_keys, delimiter=','):
+    """Return key extraction callable for a raw CSV line."""
+    if len(sort_keys) == 1:
+        col = sort_keys[0]
+        return lambda line: (
+            next(csv.reader([line], delimiter=delimiter))[col]
+            if '"' in line
+            else line.rstrip('\r\n').split(delimiter)[col]
+        )
+    getter = itemgetter(*sort_keys)
+    return lambda line: (
+        getter(next(csv.reader([line], delimiter=delimiter)))
+        if '"' in line
+        else getter(line.rstrip('\r\n').split(delimiter))
+    )
 
-    Inputs
-    ------
-    file_loc : str
-        File location of csv to sort
-    max_size : float
-        Size of maximum file in mb
-    header : bool
-        Whether is a header record or not
+def _sort_chunk_worker(args):
+    """Sort a byte range of input file and write sorted run to disk."""
+    file_loc, start, end, run_path, sort_keys, delimiter = args
+    with open(file_loc, 'r', buffering=1024 * 1024, encoding='utf-8', errors='replace') as f:
+        f.seek(start)
+        data = f.read(end - start)
 
-    Returns
-    -------
-    temp_files : list
-        List of temporary file locations
-    header_cols : str
-        String of header record
-    """
-    max_size *= 1048576
-    os.makedirs('./.tmp')
-    
-    data = ''
-    file_num = 0
-    temp_files = []
-    write_file = None
-    header_cols = None
-    with open(file_loc) as f:
-        while True:
-            row = f.readline()
-            if not row:
-                break
-            elif header and not header_cols:
-                header_cols = row
-                continue
-            
-            if not write_file:
-                file_name = './.tmp/split{0}.csv'.format(file_num)
-                temp_files.append(file_name)
-                write_file = open(file_name, 'w')
-            
-            data += row
-            if len(data) >= max_size:
-                file_num += 1
+    lines = data.splitlines(keepends=True)
+    extractor = _make_key_extractor(sort_keys, delimiter)
+    keyed = [(extractor(line), line) for line in lines]
+    keyed.sort(key=itemgetter(0))
 
-                """
-                TODO: Can't use max size larger then 2gb because of Python 
-                      issue 24658. Will throw an oserr 22 here.
-                """
+    with open(run_path, 'w', buffering=1024 * 1024, encoding='utf-8') as out:
+        out.writelines(line for _, line in keyed)
+    return run_path
 
-                write_file.write(data)
-                write_file.close()
-                
-                data = ''
-                write_file = None
+def _yield_run(file_path, extractor):
+    """Stream (key, raw_line) pairs from a sorted run."""
+    with open(file_path, 'r', buffering=256 * 1024, encoding='utf-8', errors='replace') as f:
+        for line in f:
+            yield (extractor(line), line)
 
-        #catch last file
-        if write_file:
-            write_file.write(data)
-            write_file.close()
-
-    return temp_files, header_cols
-
-def sort_file(file_loc, sort_keys, delimiter=','):
-    """
-    Sorts a file in memory based on the index of the columns in sortkeys
-    
-    Inputs
-    ------
-    file_loc : str
-        Location of file to sort
-    sort_keys : list
-        Indices of columns to sort on
-    delimiter : str
-        Delimiter to split columns on
-    """
-    #must use csv library to ensure quotes are respected
-    with open(file_loc) as f:
-        rows = [row for row in csv.reader(f, delimiter=delimiter)]
-    rows.sort(key=lambda row: [row[i] for i in sort_keys])
-
-    with open(file_loc, 'w') as f:
-        w = csv.writer(f, delimiter=delimiter)
-        for row in rows:
-            w.writerow(row)
-
-def merge_files(files, sort_keys, header=None, delimiter=','):
-    """
-    Merges already sorted files and writes to disk
-
-    Inputs
-    ------
-    files : list
-        List of sorted files to merge
-    sort_keys : list
-        Indices of columns to sort on
-    header : list
-        List of header values
-    delimiter : str
-        Delimiter to split columns on
-    """
-    #generate unique file name with hash
-    m = hashlib.md5()
-    m.update((''.join(files)).encode('utf-8'))
-    merge_name = './.tmp/' + m.hexdigest() + '.csv'
-
-    with open(merge_name, 'w') as out:
-        w = csv.writer(out, delimiter=delimiter)
-        
-        #write header on final merge
-        if header:
-            w.writerow(header)
-
-        sort_func = lambda row: [row[i] for i in sort_keys]
-        gen_files = [_yield_rows(f, delimiter=delimiter) for f in files]
-        for row in heapq.merge(*gen_files, key=sort_func):
-            w.writerow(row)
-
+def _merge_files_task(args):
+    """Merge a batch of sorted runs directly to an output file."""
+    files, out_path, sort_keys, delimiter, header_line = args
+    extractor = _make_key_extractor(sort_keys, delimiter)
+    with open(out_path, 'w', buffering=2 * 1024 * 1024, encoding='utf-8') as out:
+        if header_line:
+            out.write(header_line if header_line.endswith('\n') else header_line + '\n')
+        generators = [_yield_run(f, extractor) for f in files]
+        for _, line in heapq.merge(*generators, key=itemgetter(0)):
+            out.write(line)
     for f in files:
-        os.remove(f)
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    return out_path
 
-def _yield_rows(file_loc, delimiter=','):
-    with open(file_loc) as f:
-        for row in csv.reader(f):
-            yield row
-
-def _build_merge_tasks(files, n_way):
-    batch = []
-    merge_tasks = []
-    for f in files:
-        batch.append(f)
-        if len(batch) == n_way:
-            merge_tasks.append(batch)
-            batch = []
-    if batch:
-        merge_tasks.append(batch)
-    
-    return merge_tasks
-
-def external_sort(file_loc, sort_keys, n_proc, n_way=2, max_size=100,
+def external_sort(file_loc, sort_keys, n_proc=None, n_way=64, max_size=100,
                   header=True, delimiter=',', overwrite=False):
-    
-    """
-    Sort a file on disk rather than in memory. Many factors can make this
-    method of sorting faster or slower, but in general more processes and
-    merge ways is faster. Size of temporary files is a 'just right' situation
-    where too big can exceed memory and too small results in i/o limiatations.
+    """Sort a CSV file on disk using parallel chunking and K-way merge."""
+    if n_proc is None:
+        n_proc = cpu_count() or 4
+    n_way = max(2, n_way)
 
-    Inputs
-    ------
-    file_loc : str
-        Location of file to sort
-    sort_keys : list
-        Indices of columns to sort on
-    n_proc : int
-        Number of processes to spawn
-    n_way : int
-        Number of files to merge at once
-    max_size : float
-        Maximum temporary file size in mb
-    header : bool
-        Whether the file has a header
-    delimiter : str
-        Delimiter to split columns on
-    overwrite : bool
-        Whether to overwrite the original file or not
-    """
-    import time
-    temp_files, header_row = create_temp_files(file_loc, max_size, header)
-    header_row = header_row.strip().split(delimiter)
-    
-    #sort split files
-    s_tasks = []
-    for f in temp_files:
-        s_tasks.append(f)
+    file_size = os.path.getsize(file_loc)
+    if file_size == 0:
+        return
 
-    s_pool = Pool(processes=n_proc) 
-    while s_tasks:
-        args = (s_tasks.pop(), sort_keys, delimiter)
-        s_pool.apply_async(args)
-    
-    s_pool.close()
-    s_pool.join()
-    
-    #merge split files
-    while len(os.listdir('./.tmp/')) > 1:
-        m_pool = Pool(processes=n_proc)
-        m_files = ['./.tmp/' + f for f in os.listdir('./.tmp/')]
-        m_tasks = _build_merge_tasks(m_files, n_way)
-        
-        #catch last merge and add header
-        if len(m_tasks) == 1:
-            header_arg = (header_row, )
+    base, ext = os.path.splitext(file_loc)
+    final_target = file_loc if overwrite else f'{base}_sorted{ext}'
+
+    tmp_dir = tempfile.mkdtemp(prefix='py_ext_sort_')
+    tmp_target = os.path.join(tmp_dir, 'final_sorted.csv')
+
+    try:
+        header_line = None
+        start_offset = 0
+        with open(file_loc, 'r', encoding='utf-8', errors='replace') as f:
+            if header:
+                header_line = f.readline()
+                start_offset = f.tell()
+
+        chunk_bytes = int(max_size * 1024 * 1024)
+        chunks = []
+        idx = 0
+        with open(file_loc, 'rb') as f:
+            f.seek(start_offset)
+            curr = start_offset
+            while curr < file_size:
+                target = curr + chunk_bytes
+                if target >= file_size:
+                    run_path = os.path.join(tmp_dir, f'run_{idx}.csv')
+                    chunks.append((file_loc, curr, file_size, run_path, sort_keys, delimiter))
+                    break
+                f.seek(target)
+                f.readline()
+                end = f.tell()
+                run_path = os.path.join(tmp_dir, f'run_{idx}.csv')
+                chunks.append((file_loc, curr, end, run_path, sort_keys, delimiter))
+                curr = end
+                idx += 1
+
+        # Phase 1: Parallel in-memory chunk sorting
+        with Pool(processes=n_proc) as pool:
+            active_runs = pool.map(_sort_chunk_worker, chunks)
+
+        # Phase 2: K-Way Merge
+        if len(active_runs) == 1:
+            single_run = active_runs[0]
+            if header_line:
+                with open(single_run, 'r', encoding='utf-8', errors='replace') as rf:
+                    content = rf.read()
+                with open(tmp_target, 'w', encoding='utf-8') as wf:
+                    wf.write(header_line if header_line.endswith('\n') else header_line + '\n')
+                    wf.write(content)
+            else:
+                shutil.move(single_run, tmp_target)
         else:
-            header_arg = (None, )
+            merge_round = 0
+            with Pool(processes=n_proc) as pool:
+                while len(active_runs) > 1:
+                    is_final = (len(active_runs) <= n_way)
+                    tasks = []
+                    next_runs = []
+                    for i in range(0, len(active_runs), n_way):
+                        batch = active_runs[i:i + n_way]
+                        if len(batch) == 1 and not is_final:
+                            next_runs.append(batch[0])
+                            continue
+                        if is_final and len(batch) == len(active_runs):
+                            out_p = tmp_target
+                            h = header_line
+                        else:
+                            out_p = os.path.join(tmp_dir, f'm_{merge_round}_{i}.csv')
+                            h = None
+                            next_runs.append(out_p)
+                        tasks.append((batch, out_p, sort_keys, delimiter, h))
+                    pool.map(_merge_files_task, tasks)
+                    active_runs = next_runs
+                    merge_round += 1
 
-        while m_tasks:
-            args = (m_tasks.pop(), sort_keys) + header_arg
-            m_pool.apply_async(merge_files, args)
-        
-        m_pool.close()
-        m_pool.join()
-    
-    #clean up tmp directory
-    if overwrite:
-        new_file_loc = file_loc
-    else:
-        file_ext = file_loc.split('.')[-1]
-        file_name = '.'.join(file_loc.split('.')[:-1])
-        new_file_loc = file_name + '_sorted.' +  file_ext
-    
-    merged_file = './.tmp/' + os.listdir('./.tmp/')[0]
-    os.rename(merged_file, new_file_loc)
-    os.rmdir('./.tmp/')
+        shutil.move(tmp_target, final_target)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
